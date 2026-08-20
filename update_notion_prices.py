@@ -48,6 +48,13 @@ TICKERS = [
     {"source": "twelvedata", "symbol": "AAPL", "exchange": None, "notion_name": "AAPL"},
     {"source": "twelvedata", "symbol": "NOW", "exchange": None, "notion_name": "NOW"},
     {"source": "twelvedata", "symbol": "NVDA", "exchange": None, "notion_name": "NVDA"},
+    {"source": "twelvedata", "symbol": "TSM", "exchange": None, "notion_name": "TSM"},
+    {"source": "twelvedata", "symbol": "META", "exchange": None, "notion_name": "META"},
+    {"source": "twelvedata", "symbol": "MSFT", "exchange": None, "notion_name": "MSFT"},
+    {"source": "twelvedata", "symbol": "BE", "exchange": None, "notion_name": "BE"},
+    {"source": "twelvedata", "symbol": "NBIS", "exchange": None, "notion_name": "NBIS"},
+    {"source": "twelvedata", "symbol": "AAOI", "exchange": None, "notion_name": "AAOI"},
+    {"source": "twelvedata", "symbol": "GOOG", "exchange": None, "notion_name": "GOOG"},
     {"source": "yahoo", "symbol": "XEQT.TO", "notion_name": "XEQT"},
 ]
  
