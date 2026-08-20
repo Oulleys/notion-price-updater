@@ -3,31 +3,27 @@ Update live stock prices in a Notion Investment Tracker database.
  
 DATA SOURCES (hybrid approach)
 ---------------------------------
-- US-listed stocks -> Twelve Data, using ONE BATCHED request for all symbols
-  at once (comma-separated), instead of one request per ticker. This is
-  critical once you're tracking many stocks: Twelve Data's free tier allows
-  8 requests/minute and 800 requests/day. One request per ticker per run
-  quickly blows through both limits as your list grows. Batching keeps this
-  at 1 request per run no matter how many US tickers you add.
-- TSX-listed ETFs (XEQT, XDIV, etc.) -> Yahoo Finance's free public endpoint
-  (no key needed, one request per TSX ticker — fine since Yahoo has no
-  documented tight rate limit for casual use).
+- US-listed stocks -> Twelve Data, batched in CHUNKS of up to 8 symbols per
+  request. Twelve Data's free tier allows 8 credits/minute, and each symbol
+  in a batched request consumes one credit simultaneously — so a single
+  batch of more than 8 symbols instantly exceeds the limit and 429s, even
+  though it's only "one request." Chunking into groups of 8 (with a short
+  pause between chunks) keeps every chunk under the per-minute cap.
+- TSX-listed ETFs (XEQT, XDIV, etc.) -> Yahoo Finance's free public endpoint.
  
 ADDING A NEW STOCK
 --------------------
-US-listed: just add its symbol to TWELVEDATA_TICKERS below, e.g.:
-    {"symbol": "TSM", "notion_name": "TSM"}
-TSX-listed (or other non-US exchange Twelve Data won't serve for free):
-    add to YAHOO_TICKERS, e.g. {"symbol": "XDIV.TO", "notion_name": "XDIV"}
+US-listed: add its symbol to TWELVEDATA_TICKERS below. No limit on total
+list size — the script automatically splits it into safe chunks of 8.
+TSX-listed: add to YAHOO_TICKERS instead, e.g. {"symbol": "XDIV.TO", ...}.
  
 Either way, ALSO add a matching row in your Notion Portfolio database with
-the exact same title as "notion_name" — the script only updates rows that
-already exist, it doesn't create new ones.
+the exact same title as "notion_name".
  
 SETUP
 ------
 Same three GitHub secrets as before: TWELVE_DATA_API_KEY, NOTION_API_KEY,
-NOTION_DATABASE_ID. Nothing new needed for this version.
+NOTION_DATABASE_ID.
 """
  
 import os
@@ -41,7 +37,6 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "TWELVE_DATA_API_KEY
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "NOTION_API_KEY")
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "NOTION_DATABASE_ID")
  
-# US-listed stocks — all fetched in a single batched Twelve Data call.
 TWELVEDATA_TICKERS = [
     {"symbol": "AAPL", "notion_name": "AAPL"},
     {"symbol": "NOW", "notion_name": "NOW"},
@@ -55,10 +50,14 @@ TWELVEDATA_TICKERS = [
     {"symbol": "GOOG", "notion_name": "GOOG"},
 ]
  
-# Non-US tickers — fetched individually from Yahoo (one request each).
 YAHOO_TICKERS = [
     {"symbol": "XEQT.TO", "notion_name": "XEQT"},
 ]
+ 
+# Max symbols per Twelve Data request — matches the free tier's 8 credits/minute cap.
+TWELVEDATA_CHUNK_SIZE = 8
+# Seconds to wait between chunks, so each lands in a fresh per-minute window.
+TWELVEDATA_CHUNK_DELAY = 65
  
 # Must match your Notion column names exactly.
 TICKER_PROP = "Ticker"
@@ -73,9 +72,13 @@ NOTION_BASE_URL = "https://api.notion.com/v1"
 YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
  
  
+def chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+ 
+ 
 def get_quotes_twelvedata_batch(tickers: list[dict]) -> dict:
-    """Fetch ALL US tickers in a single Twelve Data request. Returns a dict
-    keyed by symbol, e.g. {"AAPL": {"price": ..., "volume": ...}, ...}."""
+    """Fetch a batch (<= TWELVEDATA_CHUNK_SIZE) of tickers in one request."""
     symbols = ",".join(t["symbol"] for t in tickers)
     params = {"symbol": symbols, "apikey": TWELVE_DATA_API_KEY}
  
@@ -85,8 +88,6 @@ def get_quotes_twelvedata_batch(tickers: list[dict]) -> dict:
  
     results = {}
  
-    # Twelve Data returns a flat object (not keyed by symbol) when you only
-    # pass ONE symbol, but a dict-of-dicts keyed by symbol for multiple.
     if len(tickers) == 1:
         symbol = tickers[0]["symbol"]
         if data.get("status") == "error":
@@ -186,26 +187,32 @@ def apply_quote_to_notion(display_ticker: str, quote: dict) -> None:
  
  
 def main() -> None:
-    # --- One batched call for all US tickers ---
-    if TWELVEDATA_TICKERS:
+    # --- Twelve Data, chunked into groups of <= TWELVEDATA_CHUNK_SIZE ---
+    chunks = list(chunked(TWELVEDATA_TICKERS, TWELVEDATA_CHUNK_SIZE))
+    for i, chunk in enumerate(chunks):
         try:
-            batch_results = get_quotes_twelvedata_batch(TWELVEDATA_TICKERS)
+            batch_results = get_quotes_twelvedata_batch(chunk)
         except requests.HTTPError as e:
-            print(f"[error] Twelve Data batch request failed: {e}")
+            print(f"[error] Twelve Data chunk request failed: {e}")
             batch_results = {}
  
-        for t in TWELVEDATA_TICKERS:
+        for t in chunk:
             quote = batch_results.get(t["symbol"], {"error": "not found in batch response"})
             apply_quote_to_notion(t["notion_name"], quote)
  
-    # --- Individual Yahoo calls for non-US tickers ---
+        # Wait between chunks so each starts a fresh per-minute rate window —
+        # skip the wait after the very last chunk.
+        if i < len(chunks) - 1:
+            time.sleep(TWELVEDATA_CHUNK_DELAY)
+ 
+    # --- Yahoo, one request per non-US ticker ---
     for t in YAHOO_TICKERS:
         try:
             quote = get_quote_yahoo(t["symbol"])
         except (requests.HTTPError, ValueError) as e:
             quote = {"error": str(e)}
         apply_quote_to_notion(t["notion_name"], quote)
-        time.sleep(2)  # light courtesy delay between Yahoo calls
+        time.sleep(2)
  
  
 if __name__ == "__main__":
