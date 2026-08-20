@@ -1,42 +1,36 @@
 """
-Update live stock prices in a Notion Investment Tracker database — using Twelve Data.
+Update live stock prices in a Notion Investment Tracker database.
  
-WHY TWELVE DATA INSTEAD OF FINNHUB
-------------------------------------
-Finnhub's free tier doesn't return volume on /quote, and doesn't support
-TSX-listed tickers like XEQT.TO at all. Twelve Data's free tier supports
-both real-time price AND volume, and covers the Toronto Stock Exchange,
-so one provider now covers everything (XEQT, NOW, NVDA, etc.)
+DATA SOURCES (hybrid approach)
+---------------------------------
+- US-listed stocks (AAPL, NOW, NVDA, etc.) -> Twelve Data (free tier, real-time,
+  includes volume).
+- TSX-listed ETFs (XEQT, XDIV, etc.)       -> Yahoo Finance's free public
+  endpoint (no API key needed). Twelve Data's free tier only offers "trial"
+  access to most international exchanges including the TSX, so it 404s on
+  these — Yahoo's unofficial endpoint is the standard free workaround and
+  covers Canadian tickers with the ".TO" suffix (e.g. "XEQT.TO").
+ 
+  Note: this Yahoo endpoint is unofficial/undocumented. It's free, doesn't
+  require a key, and is widely used for exactly this purpose, but Yahoo
+  could change or restrict it without notice. Fine for a personal tracker;
+  not something to build a commercial product on.
  
 SETUP (one-time)
 ------------------
-1. Get a free Twelve Data API key: https://twelvedata.com/pricing
-   (free tier: 800 requests/day, 8 requests/minute — plenty for this)
-2. You already have your Notion integration secret + database ID from before.
-3. Add a new GitHub repo secret named TWELVE_DATA_API_KEY
-   (Settings -> Secrets and variables -> Actions -> New repository secret)
-   You can leave the old FINNHUB_API_KEY secret in place or delete it —
-   it's no longer used by this version of the script.
-4. Update the workflow file (.github/workflows/update-prices.yml) to pass
-   TWELVE_DATA_API_KEY instead of FINNHUB_API_KEY — see the snippet at the
-   bottom of this docstring.
+1. Twelve Data: https://twelvedata.com/pricing (free tier)
+2. Notion integration secret + database ID (same as before)
+3. No signup needed for Yahoo — it's used directly, no key required.
+4. GitHub repo secrets needed: TWELVE_DATA_API_KEY, NOTION_API_KEY,
+   NOTION_DATABASE_ID (same three as your last working version — nothing
+   new to add for Yahoo).
  
 TICKER FORMAT
 --------------
-Twelve Data uses "symbol" + "exchange" (or "mic_code") as separate params
-rather than suffixes. Each entry in TICKERS below is a dict:
-    {"symbol": "AAPL", "exchange": None, "notion_name": "AAPL"}
-    {"symbol": "XEQT", "exchange": "TSX", "notion_name": "XEQT"}
-"exchange" can be None for US-listed tickers (Twelve Data defaults to the
-primary US listing). "notion_name" is what must match your Notion row's
-title exactly.
- 
-UPDATED WORKFLOW FILE SNIPPET (replace the env: block in your .yml):
-    - run: python update_notion_prices.py
-      env:
-        TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+Each entry in TICKERS is a dict with a "source" field:
+    {"source": "twelvedata", "symbol": "AAPL", "exchange": None, "notion_name": "AAPL"}
+    {"source": "yahoo", "symbol": "XEQT.TO", "notion_name": "XEQT"}
+"notion_name" must match your Notion row's title exactly.
 """
  
 import os
@@ -50,12 +44,11 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "TWELVE_DATA_API_KEY
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "NOTION_API_KEY")
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "NOTION_DATABASE_ID")
  
-# List of tickers to track. "exchange" is optional (None = US default).
 TICKERS = [
-    {"symbol": "AAPL", "exchange": None, "notion_name": "AAPL"},
-    {"symbol": "NOW", "exchange": None, "notion_name": "NOW"},
-    {"symbol": "NVDA", "exchange": None, "notion_name": "NVDA"},
-    {"symbol": "XEQT", "exchange": "TSX", "notion_name": "XEQT"},
+    {"source": "twelvedata", "symbol": "AAPL", "exchange": None, "notion_name": "AAPL"},
+    {"source": "twelvedata", "symbol": "NOW", "exchange": None, "notion_name": "NOW"},
+    {"source": "twelvedata", "symbol": "NVDA", "exchange": None, "notion_name": "NVDA"},
+    {"source": "yahoo", "symbol": "XEQT.TO", "notion_name": "XEQT"},
 ]
  
 # Must match your Notion column names exactly.
@@ -65,11 +58,13 @@ VOLUME_PROP = "Volume"
  
 NOTION_VERSION = "2022-06-28"
 TWELVE_DATA_BASE_URL = "https://api.twelvedata.com/quote"
+YAHOO_BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 NOTION_BASE_URL = "https://api.notion.com/v1"
  
+YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
  
-def get_quote(symbol: str, exchange: str | None) -> dict:
-    """Fetch current price and volume for one ticker from Twelve Data."""
+ 
+def get_quote_twelvedata(symbol: str, exchange: str | None) -> dict:
     params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
     if exchange:
         params["exchange"] = exchange
@@ -83,6 +78,33 @@ def get_quote(symbol: str, exchange: str | None) -> dict:
  
     price = data.get("close")
     volume = data.get("volume")
+    return {
+        "price": float(price) if price is not None else None,
+        "volume": float(volume) if volume is not None else None,
+    }
+ 
+ 
+def get_quote_yahoo(symbol: str) -> dict:
+    url = f"{YAHOO_BASE_URL}/{symbol}"
+    resp = requests.get(url, headers=YAHOO_HEADERS, params={"interval": "1d", "range": "1d"}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+ 
+    result = data.get("chart", {}).get("result")
+    if not result:
+        error = data.get("chart", {}).get("error")
+        raise ValueError(error.get("description") if error else "No data returned")
+ 
+    meta = result[0]["meta"]
+    price = meta.get("regularMarketPrice")
+ 
+    # Volume: take the most recent value from the day's volume series, if present
+    volume = None
+    try:
+        volumes = result[0]["indicators"]["quote"][0]["volume"]
+        volume = next((v for v in reversed(volumes) if v is not None), None)
+    except (KeyError, IndexError):
+        pass
  
     return {
         "price": float(price) if price is not None else None,
@@ -91,19 +113,13 @@ def get_quote(symbol: str, exchange: str | None) -> dict:
  
  
 def find_notion_page(display_ticker: str) -> str | None:
-    """Find the Notion database row whose title matches the ticker."""
     url = f"{NOTION_BASE_URL}/databases/{DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-    payload = {
-        "filter": {
-            "property": TICKER_PROP,
-            "title": {"equals": display_ticker},
-        }
-    }
+    payload = {"filter": {"property": TICKER_PROP, "title": {"equals": display_ticker}}}
     resp = requests.post(url, headers=headers, json=payload, timeout=10)
     resp.raise_for_status()
     results = resp.json().get("results", [])
@@ -111,7 +127,6 @@ def find_notion_page(display_ticker: str) -> str | None:
  
  
 def update_notion_page(page_id: str, price: float, volume: float | None) -> None:
-    """Write the fetched price/volume into the matching Notion row."""
     url = f"{NOTION_BASE_URL}/pages/{page_id}"
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
@@ -128,12 +143,18 @@ def update_notion_page(page_id: str, price: float, volume: float | None) -> None
  
 def main() -> None:
     for entry in TICKERS:
-        symbol = entry["symbol"]
-        exchange = entry.get("exchange")
         display_ticker = entry["notion_name"]
+        source = entry["source"]
  
         try:
-            quote = get_quote(symbol, exchange)
+            if source == "twelvedata":
+                quote = get_quote_twelvedata(entry["symbol"], entry.get("exchange"))
+            elif source == "yahoo":
+                quote = get_quote_yahoo(entry["symbol"])
+            else:
+                print(f"[error] {display_ticker}: unknown source '{source}'")
+                continue
+ 
             if quote["price"] is None:
                 print(f"[skip] {display_ticker}: no price returned")
                 continue
@@ -150,9 +171,11 @@ def main() -> None:
         except (requests.HTTPError, ValueError) as e:
             print(f"[error] {display_ticker}: {e}")
  
-        # Twelve Data free tier: 8 requests/minute — space calls out safely
+        # Twelve Data free tier: 8 requests/minute. Yahoo has no strict published
+        # limit, but a small delay is polite and avoids accidental rate limiting.
         time.sleep(8)
  
  
 if __name__ == "__main__":
     main()
+ 
