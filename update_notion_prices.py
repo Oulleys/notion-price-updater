@@ -1,102 +1,95 @@
 """
-Update live stock prices in a Notion Investment Tracker database.
-
-WHAT THIS DOES
----------------
-For each ticker in TICKERS, this script:
-  1. Fetches the current price and volume from Finnhub (free-tier API)
-  2. Finds the matching row in your Notion database (matched by ticker name)
-  3. Updates the "Current price" and "Volume" properties on that row
-
+Update live stock prices in a Notion Investment Tracker database — using Twelve Data.
+ 
+WHY TWELVE DATA INSTEAD OF FINNHUB
+------------------------------------
+Finnhub's free tier doesn't return volume on /quote, and doesn't support
+TSX-listed tickers like XEQT.TO at all. Twelve Data's free tier supports
+both real-time price AND volume, and covers the Toronto Stock Exchange,
+so one provider now covers everything (XEQT, NOW, NVDA, etc.)
+ 
 SETUP (one-time)
 ------------------
-1. Get a free Finnhub API key: https://finnhub.io/register
-2. Create a Notion internal integration: https://www.notion.so/my-integrations
-   - Copy the "Internal Integration Secret"
-3. Share your Investment Tracker database with that integration:
-   - Open the database in Notion -> "..." menu (top right) -> Connections -> add your integration
-4. Get your database ID:
-   - Open the database as a full page in your browser
-   - Copy the 32-character ID from the URL, e.g.
-     https://www.notion.so/myworkspace/DATABASE_ID?v=...
-5. Fill in the four values below (FINNHUB_API_KEY, NOTION_API_KEY, DATABASE_ID)
-6. Make sure your Notion property names match PRICE_PROP / VOLUME_PROP / TICKER_PROP
-   below (edit them if your actual property names differ).
-
-RUNNING IT
------------
-Locally:      pip install requests
-              python update_notion_prices.py
-
-On a schedule (recommended): use GitHub Actions with a cron trigger, e.g.
-  .github/workflows/update-prices.yml
-    on:
-      schedule:
-        - cron: '*/15 * * * *'   # every 15 minutes
-    jobs:
-      update:
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-          - uses: actions/setup-python@v5
-            with:
-              python-version: '3.11'
-          - run: pip install requests
-          - run: python update_notion_prices.py
-            env:
-              FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-              NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-              NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-
-  (Store your keys as GitHub repo secrets instead of hardcoding them, then
-   swap the constants below for os.environ.get(...) calls, as already set up.)
+1. Get a free Twelve Data API key: https://twelvedata.com/pricing
+   (free tier: 800 requests/day, 8 requests/minute — plenty for this)
+2. You already have your Notion integration secret + database ID from before.
+3. Add a new GitHub repo secret named TWELVE_DATA_API_KEY
+   (Settings -> Secrets and variables -> Actions -> New repository secret)
+   You can leave the old FINNHUB_API_KEY secret in place or delete it —
+   it's no longer used by this version of the script.
+4. Update the workflow file (.github/workflows/update-prices.yml) to pass
+   TWELVE_DATA_API_KEY instead of FINNHUB_API_KEY — see the snippet at the
+   bottom of this docstring.
+ 
+TICKER FORMAT
+--------------
+Twelve Data uses "symbol" + "exchange" (or "mic_code") as separate params
+rather than suffixes. Each entry in TICKERS below is a dict:
+    {"symbol": "AAPL", "exchange": None, "notion_name": "AAPL"}
+    {"symbol": "XEQT", "exchange": "TSX", "notion_name": "XEQT"}
+"exchange" can be None for US-listed tickers (Twelve Data defaults to the
+primary US listing). "notion_name" is what must match your Notion row's
+title exactly.
+ 
+UPDATED WORKFLOW FILE SNIPPET (replace the env: block in your .yml):
+    - run: python update_notion_prices.py
+      env:
+        TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
 """
-
+ 
 import os
 import time
 import requests
-
+ 
 # ---------------------------------------------------------------------------
-# CONFIG — fill these in (or set as environment variables / GitHub secrets)
+# CONFIG
 # ---------------------------------------------------------------------------
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "FINNHUB_API_KEY")
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "YOUR_TWELVE_DATA_KEY_HERE")
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "NOTION_API_KEY")
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "NOTION_DATABASE_ID")
-
-# The tickers you want to track. For ETFs like XEQT (Canadian, TSX-listed),
-# Finnhub needs the exchange suffix — use "XEQT.TO".
-TICKERS = ["TSM", "NOW", "NVDA", "XEQT.TO", "META", "MSFT"]
-
-# These must match your actual Notion property names exactly.
-TICKER_PROP = "Ticker"          # the title property that holds e.g. "AAPL"
-PRICE_PROP = "Current price"  # a Number property
-VOLUME_PROP = "Volume"        # a Number property
-
+ 
+# List of tickers to track. "exchange" is optional (None = US default).
+TICKERS = [
+    {"symbol": "AAPL", "exchange": None, "notion_name": "AAPL"},
+    {"symbol": "NOW", "exchange": None, "notion_name": "NOW"},
+    {"symbol": "NVDA", "exchange": None, "notion_name": "NVDA"},
+    {"symbol": "XEQT", "exchange": "TSX", "notion_name": "XEQT"},
+]
+ 
+# Must match your Notion column names exactly.
+TICKER_PROP = "Ticker"
+PRICE_PROP = "Current price"
+VOLUME_PROP = "Volume"
+ 
 NOTION_VERSION = "2022-06-28"
-FINNHUB_BASE_URL = "https://finnhub.io/api/v1/quote"
+TWELVE_DATA_BASE_URL = "https://api.twelvedata.com/quote"
 NOTION_BASE_URL = "https://api.notion.com/v1"
-
-
-def get_quote(symbol: str) -> dict:
-    """Fetch current price and volume for one ticker from Finnhub."""
-    resp = requests.get(
-        FINNHUB_BASE_URL,
-        params={"symbol": symbol, "token": FINNHUB_API_KEY},
-        timeout=10,
-    )
+ 
+ 
+def get_quote(symbol: str, exchange: str | None) -> dict:
+    """Fetch current price and volume for one ticker from Twelve Data."""
+    params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
+    if exchange:
+        params["exchange"] = exchange
+ 
+    resp = requests.get(TWELVE_DATA_BASE_URL, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    # Finnhub's /quote endpoint returns 'c' (current price).
-    # Note: Finnhub's free tier does not return live volume via /quote for
-    # every exchange — if "Volume" comes back as 0 or missing for a ticker,
-    # you may need a different endpoint/provider for that symbol (e.g. Twelve
-    # Data), or leave Volume as a manual/less-frequent update.
+ 
+    if data.get("status") == "error":
+        raise ValueError(data.get("message", "Unknown Twelve Data error"))
+ 
+    price = data.get("close")
+    volume = data.get("volume")
+ 
     return {
-        "price": data.get("c"),
-        "volume": data.get("v", None),
+        "price": float(price) if price is not None else None,
+        "volume": float(volume) if volume is not None else None,
     }
-
-
+ 
+ 
 def find_notion_page(display_ticker: str) -> str | None:
     """Find the Notion database row whose title matches the ticker."""
     url = f"{NOTION_BASE_URL}/databases/{DATABASE_ID}/query"
@@ -115,8 +108,8 @@ def find_notion_page(display_ticker: str) -> str | None:
     resp.raise_for_status()
     results = resp.json().get("results", [])
     return results[0]["id"] if results else None
-
-
+ 
+ 
 def update_notion_page(page_id: str, price: float, volume: float | None) -> None:
     """Write the fetched price/volume into the matching Notion row."""
     url = f"{NOTION_BASE_URL}/pages/{page_id}"
@@ -128,37 +121,38 @@ def update_notion_page(page_id: str, price: float, volume: float | None) -> None
     properties = {PRICE_PROP: {"number": price}}
     if volume is not None:
         properties[VOLUME_PROP] = {"number": volume}
-
+ 
     resp = requests.patch(url, headers=headers, json={"properties": properties}, timeout=10)
     resp.raise_for_status()
-
-
+ 
+ 
 def main() -> None:
-    for symbol in TICKERS:
-        # Strip exchange suffix for matching the Notion row title
-        display_ticker = symbol.replace(".TO", "")
-
+    for entry in TICKERS:
+        symbol = entry["symbol"]
+        exchange = entry.get("exchange")
+        display_ticker = entry["notion_name"]
+ 
         try:
-            quote = get_quote(symbol)
+            quote = get_quote(symbol, exchange)
             if quote["price"] is None:
-                print(f"[skip] {symbol}: no price returned")
+                print(f"[skip] {display_ticker}: no price returned")
                 continue
-
+ 
             page_id = find_notion_page(display_ticker)
             if page_id is None:
                 print(f"[skip] {display_ticker}: no matching Notion row found "
                       f"(add a row named exactly '{display_ticker}' first)")
                 continue
-
+ 
             update_notion_page(page_id, quote["price"], quote["volume"])
             print(f"[ok] {display_ticker}: price={quote['price']} volume={quote['volume']}")
-
-        except requests.HTTPError as e:
-            print(f"[error] {symbol}: {e}")
-
-        # Finnhub free tier allows 60 calls/min — small delay keeps you safe
-        time.sleep(1.1)
-
-
+ 
+        except (requests.HTTPError, ValueError) as e:
+            print(f"[error] {display_ticker}: {e}")
+ 
+        # Twelve Data free tier: 8 requests/minute — space calls out safely
+        time.sleep(8)
+ 
+ 
 if __name__ == "__main__":
     main()
